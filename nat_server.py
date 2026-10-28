@@ -1,194 +1,200 @@
-import socket
-import select
 import argparse
-from src.const import RECV_MAX_SIZE
+import socket
+import threading
 
-# In NAT Server, will exist 3 type socket,
-#  - `server socket`,
-#  - `conn socket`(created by actively connecting nat server)
-#  - `http socket`(created by http request, which will be closed after http response)
-# Caution: The `server socket` and `conn socket` need to be persistent.
-server_socket_list = []
-conn_socket_list = []
-http_socket_list = []
+from src.const import HTTP_IO_TIMEOUT, MAX_LINE_SIZE
+from src.socket_helper import (
+    BufferedSocket,
+    read_http_message,
+    simple_http_response,
+)
 
-# The socket which `server socket` created directly or  indirectly, should put into the `read socket` list.
-
+# remote_port (int) -> {
+#     "channel": BufferedSocket,  # persistent conn registered by the nat client
+#     "channel_lock": Lock,       # serializes request/response over the channel
+#     "listener": socket,         # public listener bound on remote_port
+# }
 proxy_nat_client_port_map = {}
+map_lock = threading.Lock()
 
 
-def createNatServerSocket(ip, port):
-    print("NatServer: '{}:{}', running...".format(ip, port))
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.bind((ip, port))
-    server_socket.listen(5)
-    return server_socket
+def create_listen_socket(port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", port))
+    s.listen(128)
+    return s
 
 
-def createRemoteHttpSocket(ip, port):
-    print("RemoteHttp: '{}:{}', running...".format(ip, port))
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.bind((ip, port))
-    server_socket.listen(5)
-    return server_socket
-
-
-def handle_register_request(data: bytes):
-    message = data.decode()
-    print("handle register request data: {}".format(message))
-    if not message:
-        raise Exception("handle_register_request err: no data")
-
-    flag_filed, proxy_type, remote_port = message.split(";")
-    if proxy_type == "http":
-        port = int(remote_port)
-        server_socket = createRemoteHttpSocket(ip="0.0.0.0", port=port)
-        return proxy_type, remote_port, server_socket
-    else:
-        raise Exception("unvalid proxy_type : {}".format(proxy_type))
-
-
-def find_proxy_nat_client(register_port):
-    if register_port not in proxy_nat_client_port_map:
-        return None
-    else:
-        return proxy_nat_client_port_map[register_port]["channel_socket"]
-
-
-def find_request_host(request_lines):
-    request_port = None
-    for request_line in request_lines:
-        if "host" in request_line.lower():
-            request_port = request_line.split(":")[-1]
-
-    if not request_port:
-        raise Exception(
-            "according request_data, request_port not found. Detail: {}".format(
-                request_lines
-            )
-        )
-    return request_port
-
-
-def handle_http_request_proxy_to_nat_client(req_port, req_data):
-    # s = proxy_nat_client_port_map[req_port]["channel_socket"]
-    proxy_nat_client_socket = find_proxy_nat_client(req_port)
-    if not proxy_nat_client_socket:
-        errmsg = "Req port: {}, not register.".format(req_port)
-        raise Exception(errmsg)
-
-    else:
-        proxy_nat_client_socket.sendall(req_data)
-        recv_data = proxy_nat_client_socket.recv(RECV_MAX_SIZE)
-        return recv_data
-
-
-def handle_http_request(s, request_data):
-    # [
-    #     "GET / HTTP/1.1",
-    #     "Host: 127.0.0.1:8812",
-    #     "Connection: keep-alive",
-    #     "Cache-Control: max-age=0",
-    # ]
-    request_lines = request_data.decode().split("\r\n")
-    print("handle http request. {}".format(request_lines))
-    header = request_lines[0]
-    host_info = request_lines[1]
-
-    method, path, protocol = header.split(" ")
-    print(method, path, protocol)
-
-    request_port = find_request_host(request_lines)
-    res = handle_http_request_proxy_to_nat_client(request_port, request_data)
-    print("recv handle_http_request res: {}".format(res))
-    s.sendall(res)
-
-
-def handle_request(s):
-    request_data = s.recv(RECV_MAX_SIZE)
-    if not request_data:
-        print("Due to no data reva, client socket close, {}".format(s))
-        s.close()
-
-    # request_data expect 3 type.
-    #   -  http request data
-    #   -  cmd: request `nat server` bind ip
-    #   -  other.
+def close_quietly(sock):
+    # shutdown() first: a listener close() alone does not free the port while
+    # another thread is blocked in accept() on it (the syscall holds a file
+    # reference until it returns; shutdown forces it to error out).
     try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
 
-        request_lines = request_data.decode().split("\r\n")
-        request_line = request_lines[0]
 
-        if "HTTP" in request_line:
-            # Parse HTTP header
-            # ---------------
-            # HTTP/1.1 200 OK
-            # Server: nginx
-            # Content-Type: text/html
-            # Content-Length: 12
-            handle_http_request(s, request_data)
-            # if s in http_socket_list:
-            #     http_socket_list.remove(s)
-            print("http socket handled, should be removed, {}".format(s))
-            s.close()
+def unregister(remote_port, entry=None):
+    """Drop a registration and release its listener and channel socket.
 
-        elif "register" in request_line:
-            # Parse register command header
-            # ---------------
-            # example: 'register;http;8811'
-            proxy_type, remote_port, server_socket = handle_register_request(
-                request_data
+    If ``entry`` is given, only unregister when the map still holds that
+    entry, so a failing in-flight request cannot remove a newer
+    registration for the same port.
+    """
+    with map_lock:
+        current = proxy_nat_client_port_map.get(remote_port)
+        if current is None or (entry is not None and current is not entry):
+            return
+        del proxy_nat_client_port_map[remote_port]
+    close_quietly(current["listener"])
+    close_quietly(current["channel"].sock)
+    print("NatClient unregistered, remote_port={}".format(remote_port))
+
+
+def send_control_reply(conn, message):
+    try:
+        conn.sendall(message.encode() + b"\r\n")
+    except OSError:
+        pass
+
+
+def handle_http_conn(conn, remote_port):
+    """Proxy one HTTP request (accepted on a remote listener) to the
+    registered nat client and write its response back."""
+    conn.settimeout(HTTP_IO_TIMEOUT)
+    try:
+        request = read_http_message(BufferedSocket(conn))
+    except (OSError, ConnectionError, ValueError) as err:
+        print("Invalid http request on port {}: {}".format(remote_port, err))
+        conn.close()
+        return
+
+    with map_lock:
+        entry = proxy_nat_client_port_map.get(remote_port)
+    if entry is None:
+        try:
+            conn.sendall(simple_http_response(404, "Not Found", b"port not registered"))
+        except OSError:
+            pass
+        conn.close()
+        return
+
+    try:
+        with entry["channel_lock"]:
+            entry["channel"].sock.sendall(request)
+            response = read_http_message(entry["channel"])
+        conn.sendall(response)
+    except (OSError, ConnectionError, ValueError) as err:
+        print("Channel to nat client failed (port {}): {}".format(remote_port, err))
+        try:
+            conn.sendall(
+                simple_http_response(502, "Bad Gateway", b"nat client unavailable")
             )
-            proxy_nat_client_port_map[remote_port] = {
-                "remote_port": remote_port,
-                "proxy_type": proxy_type,
-                "server_socket": server_socket,
-                "channel_socket": s,
-            }
-            server_socket_list.append(server_socket)
+        except OSError:
+            pass
+        # Free the port so the client can reconnect and re-register.
+        unregister(remote_port, entry=entry)
+    finally:
+        conn.close()
 
-        else:
-            print("unkonown request, close socket. {}".format(request_data))
-            s.close()
 
-    except Exception as err:
-        print(err)
+def remote_accept_loop(remote_port, listener):
+    while True:
+        try:
+            conn, address = listener.accept()
+        except OSError:
+            # Listener closed by unregister(); exit the loop.
+            return
+        print("Http request from: {} (remote_port={})".format(address, remote_port))
+        threading.Thread(
+            target=handle_http_conn, args=(conn, remote_port), daemon=True
+        ).start()
+
+
+def handle_register(conn, reader, proxy_type, remote_port):
+    with map_lock:
+        stale = proxy_nat_client_port_map.pop(remote_port, None)
+        if stale is not None:
+            close_quietly(stale["listener"])
+            close_quietly(stale["channel"].sock)
+            print("Dropped stale registration, remote_port={}".format(remote_port))
+        listener = create_listen_socket(remote_port)
+        proxy_nat_client_port_map[remote_port] = {
+            "channel": reader,
+            "channel_lock": threading.Lock(),
+            "listener": listener,
+        }
+    threading.Thread(
+        target=remote_accept_loop, args=(remote_port, listener), daemon=True
+    ).start()
+    send_control_reply(conn, "ok;{}".format(remote_port))
+    print(
+        "NatClient registered, remote_port={}, proxy_type={}".format(
+            remote_port, proxy_type
+        )
+    )
+    # The channel socket stays open, owned by the map entry. This thread ends
+    # here; channel traffic is driven by handle_http_conn under channel_lock.
+
+
+def handle_control_conn(conn, address):
+    """Handle one connection on the control port: the only valid command is
+    'register;<proxy_type>;<remote_port>' followed by CRLF."""
+    conn.settimeout(HTTP_IO_TIMEOUT)
+    reader = BufferedSocket(conn)
+    try:
+        line = reader.read_until(b"\r\n", MAX_LINE_SIZE).decode().strip()
+    except (OSError, ConnectionError, ValueError) as err:
+        print("Invalid control message from {}: {}".format(address, err))
+        conn.close()
+        return
+
+    parts = line.split(";")
+    if len(parts) == 3 and parts[0] == "register" and parts[1] == "http":
+        try:
+            remote_port = int(parts[2])
+            if not 1 <= remote_port <= 65535:
+                raise ValueError("port out of range")
+        except ValueError:
+            send_control_reply(conn, "error;invalid remote_port")
+            conn.close()
+            return
+        try:
+            handle_register(conn, reader, parts[1], remote_port)
+        except OSError as err:
+            send_control_reply(conn, "error;{}".format(err))
+            conn.close()
+    else:
+        send_control_reply(conn, "error;unknown command")
+        conn.close()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="NAT Client")
-    parser.add_argument("--port", help="Nat Server Port.", required=True)
+    parser = argparse.ArgumentParser(description="NAT Server")
+    parser.add_argument("--port", type=int, help="NAT Server control port", required=True)
     args = parser.parse_args()
+    if not 1 <= args.port <= 65535:
+        parser.error("--port must be between 1 and 65535")
 
-    nat_server_socket = createNatServerSocket(ip="0.0.0.0", port=int(args.port))
-    server_socket_list.append(nat_server_socket)
+    control_socket = create_listen_socket(args.port)
+    print("NatServer: '0.0.0.0:{}', running...".format(args.port))
     try:
-
         while True:
-            # fileno: -1 , closed.
-            read_socket_list = [
-                s
-                for s in (server_socket_list + conn_socket_list + http_socket_list)
-                if s.fileno() != -1
-            ]
-
-            readable, writable, errored = select.select(read_socket_list, [], [])
-
-            for s in readable:
-                if s in server_socket_list:
-                    # For server socket (which bind port to watch request), it create socket.
-                    conn_socket, address = s.accept()
-                    conn_socket_list.append(conn_socket)
-                    print("Connection from: {}".format(address))
-                else:
-                    # For the other socket, handle the data from socket recv.
-                    handle_request(s)
-
-    except Exception as err:
-        print(err)
-
+            conn, address = control_socket.accept()
+            print("Connection from: {}".format(address))
+            threading.Thread(
+                target=handle_control_conn, args=(conn, address), daemon=True
+            ).start()
+    except KeyboardInterrupt:
+        pass
     finally:
-        nat_server_socket.close()
+        control_socket.close()
 
 
 if __name__ == "__main__":
