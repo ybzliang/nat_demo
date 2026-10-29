@@ -40,8 +40,13 @@ Then `curl http://<nat_server_ip>:<remote_port>/` reaches `127.0.0.1:local_port`
 
 ## Protocol
 
-- Control port (`--port`): the client sends `register;http;<remote_port>[;<token>]`
-  + CRLF; the server replies `ok;<remote_port>` or `error;<reason>` + CRLF.
+- Control port (`--port`): the server greets with `nonce;<hex>` + CRLF; the
+  client replies `register;http;<remote_port>;<hmac_sha256(token, nonce)>` +
+  CRLF; the server answers `ok;<remote_port>` or `error;<reason>` + CRLF.
+  The token itself never crosses the wire (challenge-response), and each
+  nonce is single-use so a replayed digest cannot register.
+- Registering a port already owned by a live channel is refused with
+  `error;port in use`; only a dead channel's port is replaceable.
 - Channel (the persistent client connection): messages are framed as
   `<8-byte big-endian length><payload>` carrying one complete HTTP request
   or response each.

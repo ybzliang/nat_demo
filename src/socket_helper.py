@@ -39,13 +39,18 @@ class BufferedSocket:
         return data
 
     def read_to_eof(self, max_size=HTTP_MAX_MESSAGE_SIZE):
-        """Read until the peer closes (or the stream stalls); used for
-        close-delimited HTTP/1.0 response bodies."""
+        """Read until the peer cleanly closes; used for close-delimited
+        HTTP/1.0 response bodies. Timeouts and resets are NOT clean EOF —
+        they propagate so a stalled/truncated body fails instead of
+        being forwarded as a complete response."""
         while True:
             try:
-                self._fill()
+                chunk = self.sock.recv(RECV_MAX_SIZE)
             except OSError:
+                raise
+            if not chunk:
                 break
+            self.buf += chunk
             if len(self.buf) > max_size:
                 raise ValueError("message exceeds {} bytes".format(max_size))
         data = bytes(self.buf)
@@ -122,18 +127,22 @@ def read_http_response(reader: BufferedSocket, method: str = "") -> bytes:
 
     Unlike requests, responses may be close-delimited (HTTP/1.0 or
     'Connection: close' without a length) or carry no body at all
-    (HEAD replies, 1xx, 204, 304), so framing is method/status-aware.
+    (HEAD replies, 204, 304), so framing is method/status-aware.
+    Interim 1xx responses (e.g. 100 Continue) are skipped until the
+    final response head arrives.
     """
-    head = reader.read_until(b"\r\n\r\n")
+    while True:
+        head = reader.read_until(b"\r\n\r\n")
+        status = None
+        try:
+            status = int(head.split(b"\r\n", 1)[0].split(b" ", 2)[1])
+        except (IndexError, ValueError):
+            pass
+        if status is not None and status < 200:
+            continue  # interim response — read the next head
+        break
 
-    status = None
-    try:
-        status = int(head.split(b"\r\n", 1)[0].split(b" ", 2)[1])
-    except (IndexError, ValueError):
-        pass
-    if method == "HEAD" or status is not None and (
-        status < 200 or status in (204, 304)
-    ):
+    if method == "HEAD" or status in (204, 304):
         return head
 
     transfer = _header_value(head, b"transfer-encoding")

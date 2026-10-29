@@ -1,4 +1,6 @@
 import argparse
+import hashlib
+import hmac
 import os
 import socket
 import time
@@ -22,8 +24,16 @@ def connect_channel(host, port):
 
 
 def register(reader, proxy_type, remote_port, token):
+    greeting = reader.read_until(b"\r\n", MAX_LINE_SIZE).decode().strip()
+    parts = greeting.split(";")
+    if len(parts) != 2 or parts[0] != "nonce":
+        raise ConnectionError("unexpected server greeting: {}".format(greeting))
+    # Answer the challenge: send HMAC(token, nonce), never the token itself.
+    digest = hmac.new(
+        token.encode("utf-8"), parts[1].encode("utf-8"), hashlib.sha256
+    ).hexdigest()
     reader.sock.sendall(
-        "register;{};{};{}\r\n".format(proxy_type, remote_port, token).encode()
+        "register;{};{};{}\r\n".format(proxy_type, remote_port, digest).encode()
     )
     line = reader.read_until(b"\r\n", MAX_LINE_SIZE).decode().strip()
     parts = line.split(";")

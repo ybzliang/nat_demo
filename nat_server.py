@@ -1,6 +1,8 @@
 import argparse
+import hashlib
 import hmac
 import os
+import secrets
 import socket
 import threading
 
@@ -68,8 +70,30 @@ def unregister(remote_port, entry=None):
 def send_control_reply(conn, message):
     try:
         conn.sendall(message.encode() + b"\r\n")
+        return True
     except OSError:
-        pass
+        return False
+
+
+def channel_is_dead(sock):
+    """Non-blocking check whether the peer has already gone away.
+
+    A pending byte or no data yet means the channel is alive; a clean
+    EOF or a socket error means it is dead and safe to replace.
+    The socket is switched to non-blocking mode around the peek:
+    MSG_DONTWAIT alone does not skip the timeout wait when the socket
+    already has settimeout() applied.
+    """
+    prev_timeout = sock.gettimeout()
+    try:
+        sock.setblocking(False)
+        return sock.recv(1, socket.MSG_PEEK) == b""
+    except BlockingIOError:
+        return False
+    except OSError:
+        return True
+    finally:
+        sock.settimeout(prev_timeout)
 
 
 def handle_http_conn(conn, remote_port):
@@ -127,10 +151,16 @@ def remote_accept_loop(remote_port, listener):
 
 def handle_register(conn, reader, proxy_type, remote_port):
     with map_lock:
-        stale = proxy_nat_client_port_map.pop(remote_port, None)
+        stale = proxy_nat_client_port_map.get(remote_port)
+        if stale is not None and not channel_is_dead(stale["channel"].sock):
+            # A live client owns this port; refuse takeover.
+            send_control_reply(conn, "error;port in use")
+            conn.close()
+            return
         if stale is not None:
             close_quietly(stale["listener"])
             close_quietly(stale["channel"].sock)
+            del proxy_nat_client_port_map[remote_port]
             print("Dropped stale registration, remote_port={}".format(remote_port))
         listener = create_listen_socket(remote_port)
         proxy_nat_client_port_map[remote_port] = {
@@ -152,10 +182,19 @@ def handle_register(conn, reader, proxy_type, remote_port):
 
 
 def handle_control_conn(conn, address):
-    """Handle one connection on the control port: the only valid command is
-    'register;<proxy_type>;<remote_port>' followed by CRLF."""
+    """Handle one connection on the control port.
+
+    Handshake: server sends 'nonce;<hex>', peer replies
+    'register;<proxy_type>;<remote_port>;<hmac_sha256(token, nonce)>'.
+    The token itself never crosses the wire; when no token is
+    configured any digest is accepted.
+    """
     conn.settimeout(HTTP_IO_TIMEOUT)
     reader = BufferedSocket(conn)
+    nonce = secrets.token_hex(16)
+    if not send_control_reply(conn, "nonce;{}".format(nonce)):
+        conn.close()
+        return
     try:
         line = reader.read_until(b"\r\n", MAX_LINE_SIZE).decode().strip()
     except (OSError, ConnectionError, ValueError) as err:
@@ -164,12 +203,17 @@ def handle_control_conn(conn, address):
         return
 
     parts = line.split(";")
-    if len(parts) in (3, 4) and parts[0] == "register" and parts[1] == "http":
-        supplied_token = parts[3] if len(parts) == 4 else ""
-        if SERVER_TOKEN and not hmac.compare_digest(supplied_token, SERVER_TOKEN):
-            send_control_reply(conn, "error;unauthorized")
-            conn.close()
-            return
+    if len(parts) == 4 and parts[0] == "register" and parts[1] == "http":
+        if SERVER_TOKEN:
+            expected = hmac.new(
+                SERVER_TOKEN.encode("utf-8"),
+                nonce.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            if not hmac.compare_digest(parts[3].encode("utf-8"), expected.encode("utf-8")):
+                send_control_reply(conn, "error;unauthorized")
+                conn.close()
+                return
         try:
             remote_port = int(parts[2])
             if not 1 <= remote_port <= 65535:
