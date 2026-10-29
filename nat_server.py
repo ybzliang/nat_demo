@@ -3,7 +3,6 @@ import hashlib
 import hmac
 import os
 import secrets
-import select
 import socket
 import threading
 
@@ -80,20 +79,27 @@ def channel_is_dead(entry):
     """Non-blocking check whether a registered channel's peer is gone.
 
     While a request holds channel_lock the channel is alive by
-    definition. Otherwise the socket is probed: readable means pending
-    data (alive) or EOF/error (dead). Probing under channel_lock keeps
-    the select and the peek atomic — no other thread reads the socket in
-    between — and never mutates the socket's timeout state.
+    definition. Otherwise the socket is probed with a non-blocking
+    MSG_PEEK: pending data or no data yet means alive; clean EOF or a
+    socket error means dead. Probing under channel_lock guarantees no
+    other thread touches the socket while its blocking mode is briefly
+    toggled (select() is not usable here: it rejects descriptors >=
+    FD_SETSIZE with ValueError).
     """
     if not entry["channel_lock"].acquire(blocking=False):
         return False  # a request is in flight — the channel is alive
     try:
         sock = entry["channel"].sock
-        if not select.select([sock], [], [], 0)[0]:
+        prev_timeout = sock.gettimeout()
+        try:
+            sock.setblocking(False)
+            return sock.recv(1, socket.MSG_PEEK) == b""
+        except BlockingIOError:
             return False
-        return sock.recv(1, socket.MSG_PEEK) == b""
-    except OSError:
-        return True
+        except OSError:
+            return True
+        finally:
+            sock.settimeout(prev_timeout)
     finally:
         entry["channel_lock"].release()
 
