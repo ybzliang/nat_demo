@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import os
 import secrets
+import select
 import socket
 import threading
 
@@ -75,25 +76,26 @@ def send_control_reply(conn, message):
         return False
 
 
-def channel_is_dead(sock):
-    """Non-blocking check whether the peer has already gone away.
+def channel_is_dead(entry):
+    """Non-blocking check whether a registered channel's peer is gone.
 
-    A pending byte or no data yet means the channel is alive; a clean
-    EOF or a socket error means it is dead and safe to replace.
-    The socket is switched to non-blocking mode around the peek:
-    MSG_DONTWAIT alone does not skip the timeout wait when the socket
-    already has settimeout() applied.
+    While a request holds channel_lock the channel is alive by
+    definition. Otherwise the socket is probed: readable means pending
+    data (alive) or EOF/error (dead). Probing under channel_lock keeps
+    the select and the peek atomic — no other thread reads the socket in
+    between — and never mutates the socket's timeout state.
     """
-    prev_timeout = sock.gettimeout()
+    if not entry["channel_lock"].acquire(blocking=False):
+        return False  # a request is in flight — the channel is alive
     try:
-        sock.setblocking(False)
+        sock = entry["channel"].sock
+        if not select.select([sock], [], [], 0)[0]:
+            return False
         return sock.recv(1, socket.MSG_PEEK) == b""
-    except BlockingIOError:
-        return False
     except OSError:
         return True
     finally:
-        sock.settimeout(prev_timeout)
+        entry["channel_lock"].release()
 
 
 def handle_http_conn(conn, remote_port):
@@ -152,7 +154,7 @@ def remote_accept_loop(remote_port, listener):
 def handle_register(conn, reader, proxy_type, remote_port):
     with map_lock:
         stale = proxy_nat_client_port_map.get(remote_port)
-        if stale is not None and not channel_is_dead(stale["channel"].sock):
+        if stale is not None and not channel_is_dead(stale):
             # A live client owns this port; refuse takeover.
             send_control_reply(conn, "error;port in use")
             conn.close()
