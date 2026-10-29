@@ -1,13 +1,21 @@
 import argparse
+import hmac
+import os
 import socket
 import threading
 
 from src.const import HTTP_IO_TIMEOUT, MAX_LINE_SIZE
 from src.socket_helper import (
     BufferedSocket,
-    read_http_message,
+    read_frame,
+    read_http_request,
+    send_frame,
     simple_http_response,
 )
+
+# Shared secret required on register when configured via --token/NAT_TOKEN;
+# empty means the control port accepts any registration.
+SERVER_TOKEN = ""
 
 # remote_port (int) -> {
 #     "channel": BufferedSocket,  # persistent conn registered by the nat client
@@ -69,7 +77,7 @@ def handle_http_conn(conn, remote_port):
     registered nat client and write its response back."""
     conn.settimeout(HTTP_IO_TIMEOUT)
     try:
-        request = read_http_message(BufferedSocket(conn))
+        request = read_http_request(BufferedSocket(conn))
     except (OSError, ConnectionError, ValueError) as err:
         print("Invalid http request on port {}: {}".format(remote_port, err))
         conn.close()
@@ -87,8 +95,8 @@ def handle_http_conn(conn, remote_port):
 
     try:
         with entry["channel_lock"]:
-            entry["channel"].sock.sendall(request)
-            response = read_http_message(entry["channel"])
+            send_frame(entry["channel"].sock, request)
+            response = read_frame(entry["channel"])
         conn.sendall(response)
     except (OSError, ConnectionError, ValueError) as err:
         print("Channel to nat client failed (port {}): {}".format(remote_port, err))
@@ -156,7 +164,12 @@ def handle_control_conn(conn, address):
         return
 
     parts = line.split(";")
-    if len(parts) == 3 and parts[0] == "register" and parts[1] == "http":
+    if len(parts) in (3, 4) and parts[0] == "register" and parts[1] == "http":
+        supplied_token = parts[3] if len(parts) == 4 else ""
+        if SERVER_TOKEN and not hmac.compare_digest(supplied_token, SERVER_TOKEN):
+            send_control_reply(conn, "error;unauthorized")
+            conn.close()
+            return
         try:
             remote_port = int(parts[2])
             if not 1 <= remote_port <= 65535:
@@ -178,9 +191,17 @@ def handle_control_conn(conn, address):
 def main():
     parser = argparse.ArgumentParser(description="NAT Server")
     parser.add_argument("--port", type=int, help="NAT Server control port", required=True)
+    parser.add_argument(
+        "--token",
+        help="Shared secret clients must present to register "
+        "(default: env NAT_TOKEN; unset = no auth)",
+    )
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
+
+    global SERVER_TOKEN
+    SERVER_TOKEN = args.token if args.token is not None else os.environ.get("NAT_TOKEN", "")
 
     control_socket = create_listen_socket(args.port)
     print("NatServer: '0.0.0.0:{}', running...".format(args.port))

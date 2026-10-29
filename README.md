@@ -32,22 +32,28 @@ NAT_SERVER="10.10.2.2:8080" python3 nat_client.py --type=http --local_port=8811 
 - `local_port`: the local service to expose.
 - `remote_port`: the public port opened on the NAT server.
 - `type`: proxy protocol; only `http` is supported.
+- `--token` / env `NAT_TOKEN`: shared secret; required only when the server
+  runs with `--token` (otherwise registrations are unauthenticated — anyone
+  reaching the control port can claim or hijack ports).
 
 Then `curl http://<nat_server_ip>:<remote_port>/` reaches `127.0.0.1:local_port`.
 
 ## Protocol
 
-- Control port (`--port`): the client sends `register;http;<remote_port>` + CRLF;
-  the server replies `ok;<remote_port>` or `error;<reason>` + CRLF.
-- Remote port: each accepted connection carries one complete HTTP request,
-  forwarded through the channel; one complete HTTP response is expected back.
-- Requests/responses are framed by `\r\n\r\n` + `Content-Length`
-  (chunked transfer-encoding is not supported).
+- Control port (`--port`): the client sends `register;http;<remote_port>[;<token>]`
+  + CRLF; the server replies `ok;<remote_port>` or `error;<reason>` + CRLF.
+- Channel (the persistent client connection): messages are framed as
+  `<8-byte big-endian length><payload>` carrying one complete HTTP request
+  or response each.
+- Remote port: each accepted connection carries one complete HTTP request;
+  one complete HTTP response is written back.
+- Edge HTTP framing: `\r\n\r\n` + `Content-Length`; `Transfer-Encoding:
+  chunked` and close-delimited (HTTP/1.0) bodies are also read fully.
 - Re-registering a port replaces the stale registration; the client
   reconnects and re-registers automatically on channel failure.
 
 ## Notes
 
-- No authentication: anyone reaching the control port can register ports.
 - One in-flight request per registration (requests on a remote port are
   serialized through the channel lock).
+- Single message cap is 16MB (`HTTP_MAX_MESSAGE_SIZE` in `src/const.py`).

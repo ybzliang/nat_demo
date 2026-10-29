@@ -6,7 +6,10 @@ import time
 from src.const import CONNECT_TIMEOUT, HTTP_IO_TIMEOUT, MAX_LINE_SIZE
 from src.socket_helper import (
     BufferedSocket,
-    read_http_message,
+    read_frame,
+    read_http_response,
+    request_method,
+    send_frame,
     simple_http_response,
 )
 
@@ -18,9 +21,9 @@ def connect_channel(host, port):
     return s
 
 
-def register(reader, proxy_type, remote_port):
+def register(reader, proxy_type, remote_port, token):
     reader.sock.sendall(
-        "register;{};{}\r\n".format(proxy_type, remote_port).encode()
+        "register;{};{};{}\r\n".format(proxy_type, remote_port, token).encode()
     )
     line = reader.read_until(b"\r\n", MAX_LINE_SIZE).decode().strip()
     parts = line.split(";")
@@ -28,14 +31,14 @@ def register(reader, proxy_type, remote_port):
         raise ConnectionError("register rejected: {}".format(line))
 
 
-def proxy_to_local(request, local_port):
+def proxy_to_local(request, local_port, method):
     local = socket.create_connection(
         ("127.0.0.1", local_port), timeout=CONNECT_TIMEOUT
     )
     try:
         local.settimeout(HTTP_IO_TIMEOUT)
         local.sendall(request)
-        return read_http_message(BufferedSocket(local))
+        return read_http_response(BufferedSocket(local), method)
     finally:
         local.close()
 
@@ -43,15 +46,16 @@ def proxy_to_local(request, local_port):
 def serve(reader, local_port):
     channel = reader.sock
     while True:
-        request = read_http_message(reader)
+        request = read_frame(reader)
+        method = request_method(request)
         try:
-            response = proxy_to_local(request, local_port)
-        except OSError as err:
+            response = proxy_to_local(request, local_port, method)
+        except (OSError, ConnectionError, ValueError) as err:
             print("Local service unavailable: {}".format(err))
             response = simple_http_response(
                 502, "Bad Gateway", b"local service unavailable"
             )
-        channel.sendall(response)
+        send_frame(channel, response)
 
 
 def parse_nat_server(parser):
@@ -77,12 +81,19 @@ def parse_nat_server(parser):
 
 def main():
     parser = argparse.ArgumentParser(description="NAT Client")
-    parser.add_argument("--type", help="Proxy type, e.g. http", required=True)
+    parser.add_argument(
+        "--type", choices=["http"], help="Proxy type (only http supported)", required=True
+    )
     parser.add_argument(
         "--local_port", type=int, help="Local service port", required=True
     )
     parser.add_argument(
         "--remote_port", type=int, help="Public port to open on NAT server", required=True
+    )
+    parser.add_argument(
+        "--token",
+        help="Shared secret for registration "
+        "(default: env NAT_TOKEN; must match the server's --token if set)",
     )
     args = parser.parse_args()
     for name in ("local_port", "remote_port"):
@@ -96,7 +107,10 @@ def main():
         try:
             channel = connect_channel(nat_host, nat_port)
             reader = BufferedSocket(channel)
-            register(reader, args.type, args.remote_port)
+            token = args.token if args.token is not None else os.environ.get(
+                "NAT_TOKEN", ""
+            )
+            register(reader, args.type, args.remote_port, token)
             delay = 1
             print(
                 "Registered remote_port={} on {}:{}, proxying to 127.0.0.1:{}".format(
